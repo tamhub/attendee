@@ -1,0 +1,129 @@
+name: Continuum Production
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # run-tests:
+  #   uses: ./.github/workflows/test.yml
+  continuum-deploy:
+    # needs: run-tests
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      username: ${{ secrets.DOCKERHUB_USERNAME }}
+      password: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract Projects and change Tier
+        run: |
+          echo 'PROJECTS='"$(jq -r '[.pull_request.labels[].name | select(test("^tier:")|not)] | @json' "$GITHUB_EVENT_PATH")" >> "$GITHUB_ENV"
+          echo 'TIER='"$(jq -r '[.pull_request.labels[].name | select(test("^tier:")) | sub("^tier:";"")] | .[0] // "Patch"' "$GITHUB_EVENT_PATH")" >> "$GITHUB_ENV"
+
+      - name: Bump Version With Continuum
+        uses: fjogeleit/http-request-action@v1.7.0
+        id: bump_version
+        with:
+          url: "https://continuum.tam.codes/api/v1/charts/bump-version"
+          method: "POST"
+          timeout: 20000
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ secrets.CONTINUUM_API_TOKEN }}"}'
+          data: >
+            {"name":"verse",
+            "changeTier":"${{ env.TIER }}"}
+
+      - name: Set up New Version
+        id: tag_version
+        run: |
+          VERSION=${{ fromJson( steps.bump_version.outputs.response ).newVersion }}
+          PREV_VERSION=${{ fromJson( steps.bump_version.outputs.response ).previousVersion }}
+          echo "Continuum bumped verse → v$VERSION"
+          echo "Previous version: v$PREV_VERSION"
+          echo "NEW_VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        with:
+          push: true
+          file: ./compose/production/django/Dockerfile
+          tags: |
+            tamhub/be-verse-prod:${{ env.NEW_VERSION }}
+            tamhub/be-verse-prod:latest
+
+      - name: Docker Scout
+        id: docker-scout
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          to-latest: true
+          ignore-base: true
+          ignore-unchanged: true
+          only-fixed: true
+          write-comment: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Repository Name
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
+
+      - name: Push to Continuum
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://continuum.tam.codes/api/v1/charts"
+          method: "POST"
+          timeout: 120000
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ secrets.CONTINUUM_API_TOKEN }}"}'
+          preventFailureOnNoResponse: true
+          data: >
+            {"name":"verse",
+            "image":"tamhub/be-verse-prod:${{ env.NEW_VERSION }}",
+            "version":"v${{ env.NEW_VERSION }}",
+            "description":"Backend Chart for verse application",
+            "changeLog": ${{ toJson(format('{0} - updated version to {1}', github.event.pull_request.title, env.NEW_VERSION )) }},
+            "kind":"backend",
+            "type":"application",
+            "dependencies":[],
+            "command":["/start"],
+            "readinessProbe":true,
+            "port":8000,
+            "alias":"backend",
+            "repo":"${{ env.REPO_NAME }}",
+            "number":"${{ github.event.pull_request.number }}"}
+
+      - name: Update Project Dependencies
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://continuum.tam.codes/api/v1/projects/dependencies"
+          method: "PATCH"
+          timeout: 120000
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ secrets.CONTINUUM_API_TOKEN }}"}'
+          preventFailureOnNoResponse: true
+          data: >
+            {"projects": ${{env.PROJECTS}},
+            "dependency":"verse",
+            "version":"v${{ env.NEW_VERSION }}",
+            "repo": "${{ env.REPO_NAME }}",
+            "number":"${{ github.event.pull_request.number }}"}
